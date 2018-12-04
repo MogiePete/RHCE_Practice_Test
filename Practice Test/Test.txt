@@ -1,0 +1,88 @@
+1) Reset root password on all 3 servers to RHCEPass
+
+2) Configure Teaming with a runner of ActiveBackup on all 3 servers with the following IP scheme
+    a) krbserver - 10.0.50.230
+    b) krbclient - 10.0.50.231
+    c) storage - 10.0.50.232
+
+3) Create an ssh key on krbserver and configure passwordless root logins to krbclient and storage
+
+4) Configure krbclient and storage to be Kerberos Clients and allow authentication and delegation in SSH
+    a) Configure ssh to allow logins using kerberos
+    b) Add Principal for NFS to storage's keytab
+    c) Test Kerberos logins using ssh on krbclient from krbserver
+      i) Create use called krbtest (Pricipal exists in kerberos already with pw of password)
+
+5) Configure krbserver as an NTP server
+
+6) Configure krbclient and storage to sync time with krbserver as a peer
+
+7) Configure krbserver to be a null client to send e-mail
+
+8) Configure krbserver to be a caching only name server
+    a) Allow only dns requests from 10.0.50.0/24
+    b) Forward all requests to 8.8.8.8
+    c) Disable DNSSEC for example.com
+
+9) Configure all 3 servers to use krbserver as their primary DNS Server
+
+10) Set vm.swappiness to 10 on krbserver; make permanent
+
+11) Create a static route on krbclient routing 172.217.100/24 through 10.0.50.1
+
+12) Create a 500M iSCSI target on storage and mount on krbclient on /mnt/iscsi
+    a) Storage iqn - iqn.2018-11.local.rhcelab:storage
+    b) KrbClient iqn - iqn.2018-11.local.rhcelab:krbclient
+    c) Mount should persist through a reboot
+
+13) The storage server should export the new directory /exports/nfs using NFSv4
+    a) The export will require Kerberos authentication and full encryption
+    b) All clients on the 10.0.50.0/24 network should have read write access
+    c) The file permissions on /exports/nfs should be 1777
+
+14) Mount the new NFS mount point created on storage to /mnt/nfs on krbclient
+    a) The mount should survive a reboot
+
+15) The storage server should export the new directories /exports/samba/user and /exports/samba/group
+    a) The directories should be owned by the group smbgrp
+    b) Any new files should be owned by the group smbgrp
+    c) The Samba-only user rhcetest1 should be able to connect read-write using the password I<3RedHat to the user share and group share
+    d) The Samba-only user rhcetest2 should be able to connect read-write using the password I<3RedHat2 to only the user share
+
+16) Mount the user and group share from storage on krbclient on /mnt/samba/user and /mnt/samba/group. Group should be mounted with multiuser support
+
+17) Install MariaDB on krbserver
+    a) Configure to listen on sockets only
+
+18) Create a database called marketing with a table called users and grant full access to account marketingsvc
+    c) It should have the following fields
+      1) UserID
+      2) UserFirstName
+      3) UserLastName
+      4) UserEmailAddr
+
+19) As marketingsvc the following entries to the marketing database and config
+      1) Bruce Wayne (bwayne@wayneint.com)
+      2) Clark Kent (Clark.Kent@dailyplanet.com)
+
+20) Perform a full backup of the MariaDB server and place the backup in /sqlbackup
+
+21) Install httpd on krbserver and configure the following:
+    a) www.rhcelab.local should serve content out of /svr/www/www/ on HTTPS on port 444
+      1) The website should respond with "It's working"
+    b) webapp.rhcelab.local should server content out of /var/www/html on Port 80
+      1) The website should run a cgi-bin application that says "Hello World" from /var/webscripts
+      2) The website should host a link to the script.
+
+22) Configure a private directory in apache for user rhcetest1
+
+23) Configure a private directory in apache for users rhcetest1 and rhcetest2
+
+24) Configure the following rich rule for http traffic from krbclient
+    a) Limit to 5 connections a minute
+    b) Log with level Info and Prefix of "HTTP from KRBCLIENT:"
+    c) Restrict rule to ipv4
+
+25) Generate a report in csv file with the Time, Disk, CPU, and Memory to /reports/
+
+26) Configure port forwarding from 2222/tcp to 22/tcp for 10.0.50.0/24 on krbserver

@@ -1,0 +1,487 @@
+1) Reset root password
+    Interrupt boot process
+      At grub2 menu hit 'e'
+    Go to kernel line which starts with linux16 and add the following to the end
+      rd.break enforcing=0
+      ctrl+x to continue boot process
+    Remount filesystem as rw and chroot
+      mount -o remount,rw /sysroot
+      chroot /sysroot
+    Reset root password
+      passwd root
+    Exit chroot by hitting ctrl+d twice
+    Login using the new root password
+    Restore SELinux file context and then reboot
+      restorecon /etc/shadow
+      reboot
+
+2) Configure teaming
+    nmcli con add type team ifname team0 con-name team0 config '{"runner": {"name": "activebackup"}}'
+    nmcli con add type team-slave ifname ens33 con-name team0-slave33 master team0
+    nmcli con add type team-slave ifname ens36 con-name team0-slave36 master team0
+    nmcli con mod team0 ipv4.address '192.168.50.230/24'
+    nmcli con mod team0 ipv4.method static
+    nmcli con mod team0 ipv4.gateway '192.168.50.1'
+    nmcli con mod team0 ipv4.dns '192.168.50.70'
+
+3) Create ssh key and copy to all other servers
+    ssh-keygen -f ~/.ssh/id_rsa -t rsa -N ""
+    for i in krbclient storage; do ssh-copy-id $i; done
+
+4) Configure krbclient and storage to be Kerberos Clients and allow authentication and delegation in SSH
+    Install required packages
+      yum install krb5_workstation pam_krb -y
+    Copy krb5.conf from krbserver and storage
+      for i in storage krbclient; do scp /etc/krb5.conf $i:/etc/krb5.conf; done
+    Add Principal for storage and krbclient and save as a KeyTab
+      krbclient
+        kadmin
+        addprinc -randkey host/krbclient.rhcelab.local@RHCELAB.LOCAL
+        ktadd host/krbclient.rhcelab.local@RHCELAB.LOCAL
+      storage
+        kadmin
+        addprinc -randkey host/storage.rhcelab.local@RHCELAB.LOCAL
+        addprinc -randkey nfs/storage.rhcelab.local@RHCELAB.LOCAL
+        ktadd host/storage.rhcelab.local@RHCELAB.LOCAL
+        ktadd nfs/storage.rhcelab.local@RHCELAB.LOCAL
+    Verify contents of Keytab
+      ktlist -k /etc/krb5.keytab
+        Keytab name: FILE:/etc/krb5.keytab
+        KVNO Principal
+        ---- --------------------------------------------------------------------------
+           2 host/storage.rhcelab.local@RHCELAB.LOCAL
+       ...
+           2 nfs/storage.rhcelab.local@RHCELAB.LOCAL
+    enable krb5 authentication
+      authconfig --enablekrb5 --updateall
+    Edit /etc/ssh/ssh_config to allow kerberos logins
+      Uncomment the following lines
+        #   GSSAPIAuthentication no
+        #   GSSAPIDelegateCredentials no
+    Restart sshd service to take affect
+      systemctl restart sshd
+    Create krbtest on krbclient
+      useradd krbtest
+    From krbserver obtain kerberos ticket
+      kinit krbtest
+      ssh krbtest@krbclient
+
+5) Configure krbserver as a local time server
+    Stop, disable, and mask chronyd
+      systemctl stop chronyd
+      systemctl disable chronyd
+      systemctl mask chronyd
+    Install ntp
+      yum install ntp -y
+    edit /etc/ntp.conf and remove all entries for ntp servers (server pool....)
+      Add the following to use the local clock 127.127.1.0
+      server 127.127.1.0
+    Enable and Start NTP
+      systemctl enable ntpd
+      systemctl start ntpd
+    Verify syncing to hardware clock
+      ntpq -p
+    Add Firewall Rules for ntp
+      firewall-cmd --add-service=ntp --permanent
+
+6) Configure krbclient and storage to sync time with krbserver as a peer
+    systemctl stop chronyd
+    edit /etc/chrony.conf and remove all entries for ntp servers (server pool....)
+      Add 'peer krbserver.rhcelab.local'
+      Add 'allow 192.168.50.0/24 to allow peering
+    Start chronyd services
+      systemctl start chronyd
+    Add firewall rules for ntp
+      firewall-cmd --add-service=ntp --permanent
+
+7) Configure krbserver to be a null client to send e-mail
+    postconf -e 'myorigin=rhcelab.local'
+    postconf -e 'inet_interfaces=loopback-only'
+    postconf -e 'mydestination='
+    postconf -e 'relayhost=[smtp.rhcelab.local]'
+    postconf -e 'local_transport=error: local delivery disabled'
+    postconf -e 'mynetworks=127.0.0.0/8, [::]/128'
+
+8) Configure krbserver to be a caching only name server, disable dns-sec for example.com, forward all requests to 192.168.50.70, and allow queries from 192.168.50.0/24
+    install unbound
+      yum install unbound -y
+    edit unbound.conf and add the following entries
+      interface: 0.0.0.0
+      interface: ::0
+      access-control: 192.168.50.0/24 allow
+      domain-insecure: "example.com"
+      forward-zone:
+          name: .
+          forward-addr: 8.8.8.8
+    Enable and Start unbound
+      systemctl enable unbound
+      systemctl start unbound
+    Add firewall rules for dns
+      firewall-cmd --add-service=dns --permanent
+
+9) Configure all 3 servers to use krbserver as their primary DNS Server
+    nmcli con mod team0 ipv4.dns '192.168.50.230'
+    nmcli con down team0 && nmcli con up team0
+
+10) Set vm.swappiness to 10 on krbserver; make permanent
+    edit /etc/sysctl.conf
+      vm.swappiness = 10
+    apply the settings
+      sysctl -p
+    verify the settings
+      sysctl -a | grep vm.swappiness
+
+11) Create a static route on krbclient routing 172.217.100/24 through 192.168.50.1
+    nmcli con mod ipv4.routes
+      nmcli con mod team0 ipv4.routes '172.217.100.0/24 192.168.50.1'
+
+12) Create a 500M iSCSI target on storage and mount on krbclient on /mnt/iscsi
+    storage:
+      install iscsi targetcli
+        yum install targetcli -y
+      configure 500M partition
+        fdisk /dev/sdb
+        Command (m for help): n
+        Partition type:
+           p   primary (0 primary, 0 extended, 4 free)
+           e   extended
+        Select (default p): p
+        Partition number (1-4, default 1): 1
+        First sector (2048-4194303, default 2048):
+        Using default value 2048
+        Last sector, +sectors or +size{K,M,G} (2048-4194303, default 4194303): +500M
+        Partition 1 of type Linux and of size 500 MiB is set
+
+        Command (m for help): w
+        The partition table has been altered!
+      configure targetcli
+        /backstores/block create lun1 /dev/sdb1
+        iscsi/ create iqn.2018-11.local.rhcelab:storage
+        iscsi/iqn.2018-11.local.rhcelab:storage/tpg1/acls create iqn.2018-11.local.rhcelab:krbclient
+        iscsi/iqn.2018-11.local.rhcelab:storage/tpg1/luns create /backstores/block/lun1 1
+        iscsi/iqn.2018-11.local.rhcelab:storage/tpg1/portals create 0.0.0.0 3260
+      Add firewall rules for iscsi traffic
+        firewall-cmd --add-port=3260/tcp --permanent
+      Enable and start target service
+        systemctl enable target
+        systemctl start target
+      krbclient:
+        Install iscsi initiator package
+          yum install iscsi-initiator-utils -y
+        Edit /etc/iscsi/initiatorname.iscsi
+          InitiatorName=iqn.2018-11.local.rhcelab:krbclient
+        Enable and start iscsi service
+          systemctl enable iscsi
+          systemctl start iscsi
+        Discovery iscsi targets on storage
+          iscsiadm --mode discovery --type sendtargets --portal 192.168.50.232
+        Login to iscsi targets on storage
+          iscsiadm --mode node --targetname iqn.2018-11.local.rhcelab:storage --portal 192.168.50.232 --login
+        Check for iscsi disk
+          lsblk --scsi
+        Partition and create file system on /dev/sdb
+          fdisk /dev/sdb
+            ...
+          mkfs.xfs /dev/sdb1
+        Create iscsi directory in mnt
+          mkdir /mnt/iscsi
+        Create fstab entry using UUID
+          blkid /dev/sdb1
+          /dev/sdb1: UUID="111e71f5-c1c8-4cc0-a321-9cfd608bcf79" TYPE="xfs"
+          UUID=111e71f5-c1c8-4cc0-a321-9cfd608bcf79 /mnt/iscsi xfs        defaults,_netdev 0 0
+
+13) The storage server should export the new directory /exports/nfs using
+    Install packages for hosting NFS/Samba (Faster)
+      yum install nfs-utils -y
+    Create directory and set proper permissions
+      mkdir -m1777 -p /exports/nfs
+    edit /etc/exports
+      /exports/nfs 192.168.50.0/24(sec=krb5p,rw)
+    Create selinux fcontext
+      semanage fcontext -at "public_content_rw_t" "/exports/nfs(/.*)?"
+    Restore selinux file context to /exports/nfs
+      restorecon -vvFR /exports/
+    Set SEBooleans
+      setsebool -P nfs_export_all_ro=1 nfs_export_all_rw=1
+    Export NFS file systems
+      exportfs -avr
+    Start and Enable nfs server (RHEL 7.1)
+      systemctl enable nfs-secure-server
+      systemctl start nfs-secure-server
+    Add firewall rules for nfs
+      firewall-cmd --add-service=nfs --permanent
+
+14) Mount the new NFS mount point created on storage to /mnt/nfs on krbclient
+    Install packages for mounting nfs shares
+      yum install nfs-utils -y
+    Create directory in mnt
+      mkdir /mnt/nfs
+    Edit /etc/fstab to add entry to mount nfs mount at boot
+      storage.rhcelab.local:/exports/nfs      /mnt/nfs        nfs     defaults,_netdev,rw,sec=krb5p 0 0
+
+15) The storage server should export the new directories /exports/user and /exports/group
+    Install required packages to host smb shares
+      yum install samba samba-client -y
+    Create directories and set permissions
+      mkdir -m2775 -p /exports/{user,group}
+    Set owner of both folders
+      chgrp
+    Set selinux file context for each folder
+      semanage fcontext -at "samba_share_t" "/exports/samba/user(/.*)?"
+      semanage fcontext -at "samba_share_t" "/exports/samba/group(/.*)?"
+    Restore selinux file context to /exports/user and /exports/group
+      restorecon -vvFR /exports/
+    Set SEBooleans for Samba
+      setsebool -P samba_export_all_ro=1
+      setsebool -P samba_export_all_rw=1
+      setsebool -P samba_share_nfs=1
+    Create smbgrp user group
+      groupadd smbgrp
+    Create samba only users
+      useradd -s /sbin/nologin -g smbgrp rhcetest1
+      useradd -s /sbin/nologin -g smbgrp rhcetest2
+    Set Samba password for each user
+      smbpasswd -a rhcetest1
+      smbpasswd -a rhcetest2
+    Modify /etc/samba/smb.conf and add both shares
+      [user]
+        path = /exports/samba/user
+        write list = rhcetest1
+
+      [group]
+        path = /exports/samba/group
+        write list = @smbgrp
+    Enable and start Samba services
+      systemctl enable smb
+      systemctl start smb
+    Configure firewall for Samba
+      firewall-cmd --add-service=samba --permanent
+    Test smbclient
+      smbclient -L //localhost -U rhcetest1
+      smbclient -L //localhost -U rhcetest2
+
+16) Mount the user and group share from storage on krbclient on /mnt/samba/user and /mnt/samba/group. Group should be mounted with multiuser support
+    Install required packages for mounting remote samba shares
+      yum install samba samba-client cifs-utils -y
+    Create smbgrp user group
+      groupadd smbgrp
+    Create local users
+      useradd -g smbgrp rhcetest1
+      useradd -g smbgrp rhcetest2
+    Create folders in /mnt
+      mkdir -p /mnt/samba/{user,group}
+    Create credential files for mounting of CIFS shares
+      create two files owned by root
+        mkdir -p -m0600 /etc/samba/credentials/
+        touch /etc/samba/credentials/{user,group}.creds
+      Add user credentials to each file
+        user
+          username=rhcetest1
+          password=I<3RedHat
+        group
+          username=rhcetest2
+          password=I<3RedHat2
+    Modify fstab to mount cifs shares
+      //192.168.50.232/group /mnt/samba/group cifs _netdev,multiuser,sec=ntlmssp,credentials=/etc/samba/credentials/group.creds 0 0
+      //192.168.50.232/user /mnt/samba/user cifs _netdev,credentials=/etc/samba/credentials/user.creds 0 0
+    Mount shares
+      mount -avr cifs
+    Test access to shares
+      rhcetest1
+        cifscreds add storage
+        cd /mnt/samba/user
+        echo "Test user rhcetest1" > rhcetest1.txt
+        cd /mnt/samba/group
+        echo "Test user rhcetest1" > rhcetest1.txt
+      rhcetest2
+        cifscreds add storage
+        cd /mnt/samba/user
+        cat rhcetest1.txt
+        Try to write to folder; should be denied
+          touch test.txt
+          touch: cannot touch ‘test.txt’: Permission denied
+        cd /mnt/samba/group
+        cat rhcetest1.txt
+        echo "Test rhcetest2" > rhcetest2.txt
+
+17) Install MariaDB on krbserver and configure as follows
+    Install required packages
+      yum install mariadb mariadb-server -y
+    Configure to listen on sockets only
+      edit /etc/my.conf
+      under [mysqld]
+      skip-networking=1
+
+18) Create a database called marketing with a table called users and grant full access to account marketingsvc
+    Login to mariadb
+      mysql
+    Create marketing database;
+      create database marketing;
+    Create table user in marketing db
+      CREATE TABLE users (userID INT, userFirstName char(25), userLastName char(25), userEmailAddress char(50));
+    Create marketing service account;
+      GRANT ALL ON marketing.* to mrksvc@'localhost' IDENTIFIED by 'password';
+      FLUSH PRIVILEGES;
+
+19) As marketingsvc the following entries to the marketing database
+    Login as marketingsvc
+      mysql -umarketingsvc -p
+    Select correct database
+      use marketing;
+    Insert correct values
+      insert into users(userID,userFirstName,userLastName,userEmailAddress) values (001,"Bruce","Wayne","bwayne@wayneint.com");
+      insert into users(userID,userFirstName,userLastName,userEmailAddress) values (002,"Clark","Kent","Clark.Kent@dailyplanet.com");
+
+20) Perform a full backup of the MariaDB server and place the backup in /sqlbackup with today's date in the name
+    Create directory and set appropriate permissions
+      mkdir -m0650 -p /sqlbackup
+    Perform full backup of MariaDB server
+      mysqldump --all-databases -uroot > /sqlbackup/full_backup_$(date +'%F').sql
+
+21) Install httpd on krbserver and configure the following
+    Install necessary packages
+      yum install httpd mod_ssl -y
+    www.rhcelab.local
+      Create folder for www.rhcelab.local
+        mkdir -p /srv/www/www
+      Create index.html
+        echo "It's working" > /srv/www/www/index.html
+      Restore selinux context
+        restorecon --vvFR /srv/www
+      Copy certificates
+        cp /RHCE_LAB/TLS_Certs/www.rhcelab.local.cer /etc/pki/tls/certs/
+        cp /RHCE_LAB/TLS_Certs/www.rhcelab.local.key /etc/pki/tls/private
+      Set permissions on key file
+        chmod 0600 /etc/pki/tls/private/www.rhcelab.local.key
+      Configure httpd to listen on 444 https
+        edit /etc/httpd/conf/httpd.conf
+        Listen 444 https
+      Set selinux port for 444
+        semanage port -a -t http_port_t -p tcp 444
+      Configure VHOST for www.rhcelab.local
+        <VirtualHost *:444>
+                ServerName www.rhcelab.local
+                SSLEngine On
+                SSLProtocol all -SSLv2 -SSLv3
+                SSLCipherSuite HIGH:MEDIUM:!aNull:!MD5
+                SSLHonorCipherOrder on
+                SSLCertificateFile /etc/pki/tls/certs/www.rhcelab.local.cer
+                SSLCertificateKeyFile /etc/pki/tls/private/www.rhcelab.local.key
+                DocumentRoot /srv/www/www
+        </VirtualHost>
+
+        <Directory /srv/www/www >
+        Require all granted
+        </Directory>
+      webapp.rhcelab.local
+        Create index.html with link to cgi-bin application
+          echo "<p><a href="http://webapp.rhcelab.local/cgi-bin/hello.pl">Click Here!</a></p>" > /var/www/html/webapp/index.html
+        Create hello.pl
+          touch /var/www/cgi-bin/hello.pl
+          vim /var/www/cgi-bin/hello.pl
+            #!/usr/bin/perl
+            print "Content-type: text/html\n\n";
+            print "Hello, World!";
+        Make the file executable
+          chmod a+x /var/webscripts/hello.pl
+        Set selinux fconext for /var/webscripts
+          semanage fcontext -at httpd_sys_script_exec_t "/var/webscripts(/.*)?"
+        Restore selinux context to /var/webscripts
+          restorecon -Rv /var/webscripts
+        Enable SEBooleans to allow httpd to run cgi-bin
+          setsebool -P httpd_enable_cgi 1
+        Change default location of cgi-bin in /etc/httpd/conf/httpd.conf
+          #Trailing / required
+          ScriptAlias /cgi-bin/ "/var/webscripts/"
+          <Directory "/var/webscripts">
+            AllowOverride None
+            Options None
+            Require all granted
+          </Directory>
+        Create VHOST for webapp.rhcelab.local
+          <VirtualHost *:80>
+            ServerName webapp.rhcelab.local
+            DocumentRoot "/var/www/html/webapp"
+            ErrorLog "/var/log/httpd/webapp-error_log"
+            CustomLog "/var/log/httpd/webapp-access_log" combined
+          </VirtualHost>
+
+          <Directory /var/www/html/webapp>
+            Require all granted
+          </Directory>
+      Configure firewall for http and 444
+        firewall-cmd --add-service=http --permanent
+        firewall-cmd --add-port=444/tcp --permanent
+
+22) Configure a private directory in apache for user rhcetest1 in /var/www/html/rhcetest1 on port 8080
+    Edit /etc/http/conf/httpd.conf and add port 8080
+      Listen 8080
+    Configure Firewall to allow 8080
+      firewall-cmd --add-port=8080/tcp --permanent
+    Create user rhcetest1 on krbserver
+      useradd -s /sbin/nologin rhcetest1
+    Make a private directory for rhcetest1 to connect to via httpd
+      mkdir /var/www/html/rhcetest1
+      chown rhcetest1:rhcetest1 /var/www/html/rhcetest1
+      chmod -R 0755 /var/www/html/rhcetest1
+      chmod -R 0644 /var/www/html/rhcetest1/.htaccess
+    Create index.html file
+      echo "This is for rhcetest1" > /var/www/html/rhcetest1/index.html
+
+    Create .htaccess file in /var/www/html/rhcetest1
+      AuthType Basic
+      AuthName "Password Protected Private Directory - Enter Login Credentials:"
+      AuthUserFile "/etc/httpd/conf/.userdb"
+      Require user rhcetest1
+    Create htpasswd for rhcetest1
+      cd /etc/httpd/conf
+      htpasswd -c .userdb rhcetest1
+    Change group owner to apache and set permissions to 0640
+      chgrp apache .userdb
+      chmod 0640 .userdb
+
+23) Configure a private directory in apache for users rhcetest1 and rhcetest2 in the group dbadmins in /var/www/html/dbadmins on port 8080
+    Create rhcetest2 on krbserver and group dbadmins and add rhcetest1 and rhcetest2 to that group
+      useradd -s /sbin/nologin rhcetest2
+      groupadd dbadmins
+      usermod -aG dbadmins rhcetest1
+      usermod -aG dbadmins rhcetest2
+    Create folder in /var/www/html/ and set group owner and permissions
+      mkdir /var/www/html/dbadmins
+      chgrp dbadmins /var/www/html/dbadmins
+      chmod -R 0755 /var/www/html/dbadmins
+      chmod -R 0644 /var/www/html/dbadmins/.htaccess
+    Create index.html in /var/www/html/dbadmins
+      echo "This is the DBADMINS index.html in /var/www/html/dbadmins" > /var/www/html/dbadmins/index.html
+    Configure /etc/httpd/conf/http.conf to add Directory
+      <Directory "/var/www/html/dbadmins">
+        AllowOverride AuthConfig
+      </Directory>
+    Create .htaccess file in /var/www/html/dbadmins
+      AuthType Basic
+      AuthName "Password Protected DBAdmin Directory - Enter Login Credentials:"
+      AuthUserFile "/etc/httpd/conf/.grouppwddb"
+      AuthGroupFile "/etc/httpd/conf/.groupdb"
+      Require group dbadmins
+    Create and edit .groupdb file then set permissions
+      touch /etc/http/conf/.groupdb
+      edit /etc/http/conf/.groupdb
+        dbadmins: rhcetest1 rhcetest2
+      chgrp apache /etc/http/conf/.groupdb
+      cown 0640 /etc/http/conf/.groupdb
+    Create htpasswd for rhcetest1 and rhcetest2
+      cd /etc/httpd/conf
+      htpasswd -c .grouppwddb rhcetest1
+      htpasswd .grouppwddb rhcetest2
+    Change group owner to apache and set permissions to 0640
+      chgrp apache .grouppwddb
+      chmod 0640 .grouppwddb
+
+24) Configure the following rich rule for http traffic from krbclient
+      firewall-cmd --add-rich-rule='rule family=ipv4 source address=192.168.50.231 service name="httpd" log level=notice prefix="HTTP from KRBCLIENT: " limit value="5/m" accept' --permanent
+
+25) Generate a report in csv file with the Time, Disk, CPU, and Memory to /reports/
+    dstat -tcdm --output /reports/dstat.csv
+
+26) Configure port forwarding on the work zone from 2222/tcp to 22/tcp for 192.168.50.0/24 on krbserver
+    firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=192.168.50.0/24 forward-port port=2222 protocol=tcp to-port=22'

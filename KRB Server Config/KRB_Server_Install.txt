@@ -1,0 +1,46 @@
+Perform the following steps to install and configure KRB5-Server on krbserver:
+
+yum install krb5-server krb5-workstation.x86_64 pam_krb5
+cd /var/kerberos/krb5kdc/
+sed -i -e 's/EXAMPLE.COM/RHCELAB.LOCAL/g' kadm5.acl
+sed -i -e 's/EXAMPLE.COM/RHCELAB.LOCAL/g' kdc.conf
+
+Copy krb5.conf to /etc/krb5.conf
+
+kdb5_util create -s -r RHCELAB.LOCAL
+Enter Password
+
+systemctl enable krb5kdc kadmin
+systemctl start krb5kdc kadmin
+
+Run: kadmin.local
+
+Enter commands:
+
+addprinc root/admin -> Enter Password
+addprinc krbtest -> Enter Password
+addprinc -randkey host/krbserver.rhcelab.local
+ktadd host/krbserver.rhcelab.local
+quit to exit
+
+Configure authconfig for KRB5
+
+authconfig --enablekrb5 --updateall
+
+Configure Firewalld
+
+Define Custom Kerberos Service to add Admin Port
+
+Copy existing service xml file
+
+cp /usr/lib/firewalld/services/kerberos.xml /etc/firewalld/services/
+
+modify new kerberos file
+
+vim /etc/firewalld/services/kerberos.xml
+
+Add port:
+<port protocol="tcp" port="749"/>
+
+firewall-cmd --permanent --add-service=kerberos
+firewall-cmd --reload
