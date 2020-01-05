@@ -468,7 +468,7 @@
       edit /etc/http/conf/.groupdb
         dbadmins: rhcetest1 rhcetest2
       chgrp apache /etc/http/conf/.groupdb
-      cown 0640 /etc/http/conf/.groupdb
+      chown 0640 /etc/http/conf/.groupdb
     Create htpasswd for rhcetest1 and rhcetest2
       cd /etc/httpd/conf
       htpasswd -c .grouppwddb rhcetest1
